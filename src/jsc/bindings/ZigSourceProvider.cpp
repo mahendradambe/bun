@@ -175,7 +175,7 @@ JSC::VM& vmForBytecodeCache()
 {
     if (!s_vmForBytecodeCache) {
         const auto heapSize = JSC::HeapType::Small;
-        auto vmPtr = JSC::VM::tryCreate(heapSize);
+        auto vmPtr = Bun::tryCreateVM(heapSize);
         vmPtr->refSuppressingSaferCPPChecking();
         s_vmForBytecodeCache = vmPtr.get();
         vmPtr->heap.acquireAccess();
