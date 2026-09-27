@@ -1,9 +1,14 @@
-import { tls as ipSanCert } from "harness";
+import { tls as ipSanCert, isWindows, tempDir } from "harness";
 import assert from "node:assert";
+import { randomUUID, X509Certificate } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
+import type http from "node:http";
+import http2 from "node:http2";
+import https from "node:https";
 import net, { type AddressInfo } from "node:net";
 import path from "node:path";
+import { duplexPair } from "node:stream";
 import { describe, test } from "node:test";
 import tls from "node:tls";
 
@@ -202,6 +207,347 @@ describe("tls.connect over an existing socket verifies the certificate against o
       });
       assert.deepStrictEqual(await promise, { authorized: false, authorizationError: "ERR_TLS_CERT_ALTNAME_INVALID" });
     });
+  });
+});
+
+// Adds a pin and a callback that records its `this` to the caller's options.
+function pinned<T extends object>(callerOptions: T) {
+  let receiver: any;
+  let calls = 0;
+  const options = Object.assign(callerOptions, {
+    pin: "agent1",
+    checkServerIdentity(this: unknown) {
+      calls++;
+      receiver = this;
+      return undefined;
+    },
+  });
+  const seen = () => ({
+    calls,
+    pin: receiver?.pin,
+    host: receiver?.host,
+    path: receiver?.path,
+    ownsCallback: receiver?.checkServerIdentity === options.checkServerIdentity,
+    isCallerObject: receiver === options,
+  });
+  return { options, seen, receiver: () => receiver };
+}
+
+async function secureConnect(socket: tls.TLSSocket) {
+  try {
+    await once(socket, "secureConnect");
+  } finally {
+    socket.destroy();
+  }
+}
+
+function outcomeOf(socket: tls.TLSSocket) {
+  const { promise, resolve } = Promise.withResolvers<string>();
+  socket.on("secureConnect", () => resolve(`secureConnect, authorized=${socket.authorized}`));
+  socket.on("error", error => resolve(`error: ${error.message}`));
+  return promise.finally(() => socket.destroy());
+}
+
+async function response(request: http.ClientRequest) {
+  const [res] = await once(request, "response");
+  res.resume();
+  await once(res, "end");
+  return res.statusCode;
+}
+
+// Node calls the callback as a method of the options object that tls.connect()
+// builds: its defaults, then a copy of the caller's own properties. https and
+// http2 clients get their socket from tls.connect().
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L1671
+describe("checkServerIdentity is called with the connect options as `this`", () => {
+  const connectOptions = (own: { host?: string; path?: string }) => ({
+    calls: 1,
+    pin: "agent1",
+    host: own.host,
+    path: own.path,
+    ownsCallback: true,
+    isCallerObject: false,
+  });
+
+  test("tls.connect(options) to an IP address", async () => {
+    await withServer(async port => {
+      const { options, seen } = pinned({ ca, host: "127.0.0.1", port });
+      await secureConnect(tls.connect(options));
+      assert.deepStrictEqual(seen(), connectOptions({ host: "127.0.0.1" }));
+    });
+  });
+
+  test("tls.connect(options) to a hostname", async () => {
+    await withServer(async port => {
+      const { options, seen } = pinned({ ca, host: "localhost", port });
+      await secureConnect(tls.connect(options));
+      assert.deepStrictEqual(seen(), connectOptions({ host: "localhost" }));
+    });
+  });
+
+  test("tls.connect(port, host, options)", async () => {
+    await withServer(async port => {
+      const { options, seen } = pinned({ ca });
+      await secureConnect(tls.connect(port, "127.0.0.1", options));
+      assert.deepStrictEqual(seen(), connectOptions({ host: "127.0.0.1" }));
+    });
+  });
+
+  test("tls.connect(path, options)", async () => {
+    using dir = tempDir("tls-connect-receiver", {});
+    const socketPath = isWindows
+      ? `\\\\.\\pipe\\tls-connect-receiver-${randomUUID()}`
+      : path.join(String(dir), "tls.sock");
+    const server = tls.createServer({ key: serverKey, cert: serverCert }, c => c.end());
+    server.listen(socketPath);
+    await once(server, "listening");
+    try {
+      const { options, seen } = pinned({ ca });
+      // @ts-expect-error @types/node has no (path, options) overload
+      await secureConnect(tls.connect(socketPath, options));
+      assert.deepStrictEqual(seen(), connectOptions({ path: socketPath }));
+    } finally {
+      server.close();
+    }
+  });
+
+  test("tls.connect({ socket }) over a connected net.Socket", async () => {
+    await withRawSocketTo({ key: serverKey, cert: serverCert }, async raw => {
+      const { options, seen } = pinned({ ca, socket: raw, host: "agent1" });
+      await secureConnect(tls.connect(options));
+      assert.deepStrictEqual(seen(), connectOptions({ host: "agent1" }));
+    });
+  });
+
+  test("tls.connect({ socket }) over a net.Socket that is still connecting", async () => {
+    await withServer(async port => {
+      const raw = net.connect(port, "127.0.0.1");
+      raw.on("error", () => {});
+      try {
+        const { options, seen } = pinned({ ca, socket: raw, host: "agent1" });
+        assert.strictEqual(raw.connecting, true);
+        await secureConnect(tls.connect(options));
+        assert.deepStrictEqual(seen(), connectOptions({ host: "agent1" }));
+      } finally {
+        raw.destroy();
+      }
+    });
+  });
+
+  test("tls.connect({ socket }) over a Duplex", async () => {
+    const [clientSide, serverSide] = duplexPair();
+    const serverSocket = new tls.TLSSocket(serverSide, { isServer: true, key: serverKey, cert: serverCert });
+    serverSocket.on("error", () => {});
+    try {
+      const { options, seen } = pinned({ ca, socket: clientSide, host: "agent1" });
+      await secureConnect(tls.connect(options));
+      assert.deepStrictEqual(seen(), connectOptions({ host: "agent1" }));
+    } finally {
+      serverSocket.destroy();
+    }
+  });
+
+  test("http2.connect(authority, options)", async () => {
+    const server = http2.createSecureServer({ key: serverKey, cert: serverCert });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const { options, seen } = pinned({ ca });
+      const session = http2.connect(`https://127.0.0.1:${(server.address() as AddressInfo).port}`, options);
+      try {
+        await once(session, "connect");
+      } finally {
+        session.destroy();
+      }
+      assert.deepStrictEqual(seen(), connectOptions({ host: "127.0.0.1" }));
+    } finally {
+      server.close();
+    }
+  });
+
+  describe("https", () => {
+    async function withHttpsServer(fn: (port: number) => Promise<void>) {
+      const server = https.createServer({ key: serverKey, cert: serverCert }, (_req, res) => res.end("ok"));
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      try {
+        await fn((server.address() as AddressInfo).port);
+      } finally {
+        server.close();
+        server.closeAllConnections();
+      }
+    }
+
+    // The request options of https have `path: null`.
+    const requestOptions = { ...connectOptions({ host: "127.0.0.1" }), path: null };
+
+    test("https.request(options) with the default agent", async () => {
+      await withHttpsServer(async port => {
+        const { options, seen } = pinned({ ca, host: "127.0.0.1", port });
+        assert.strictEqual(await response(https.request(options).end()), 200);
+        assert.deepStrictEqual(seen(), requestOptions);
+      });
+    });
+
+    test("https.request(options) with agent: false", async () => {
+      await withHttpsServer(async port => {
+        const { options, seen } = pinned({ ca, host: "127.0.0.1", port, agent: false });
+        assert.strictEqual(await response(https.request(options).end()), 200);
+        assert.deepStrictEqual(seen(), requestOptions);
+      });
+    });
+
+    test("https.get(url, options)", async () => {
+      await withHttpsServer(async port => {
+        const { options, seen } = pinned({ ca });
+        assert.strictEqual(await response(https.get(`https://127.0.0.1:${port}/`, options)), 200);
+        assert.deepStrictEqual(seen(), requestOptions);
+      });
+    });
+
+    test("new https.Agent(options), whose options win over the request options", async () => {
+      await withHttpsServer(async port => {
+        const { options, seen } = pinned({ ca });
+        const agent = new https.Agent(options);
+        try {
+          const request = https.request({ host: "127.0.0.1", port, agent, pin: "the pin of the request" } as object);
+          assert.strictEqual(await response(request.end()), 200);
+        } finally {
+          agent.destroy();
+        }
+        assert.deepStrictEqual(seen(), requestOptions);
+      });
+    });
+  });
+
+  test("a callback that is a method can compare the certificate with `this.pin`", async () => {
+    const { fingerprint256 } = new X509Certificate(serverCert);
+    await withServer(async port => {
+      const connect = (pin: string) =>
+        tls.connect({
+          host: "127.0.0.1",
+          port,
+          ca,
+          pin,
+          checkServerIdentity(this: { pin: string }, _hostname: string, cert: tls.PeerCertificate) {
+            return cert.fingerprint256 === this.pin ? undefined : new Error("pin mismatch");
+          },
+        } as tls.ConnectionOptions);
+      assert.strictEqual(await outcomeOf(connect(fingerprint256)), "secureConnect, authorized=true");
+      assert.strictEqual(await outcomeOf(connect("not the fingerprint of agent1")), "error: pin mismatch");
+    });
+  });
+
+  // Sloppy mode turns a missing `this` into globalThis. A callback that guards
+  // on `this.pin` then skips its check and accepts every certificate.
+  test("a sloppy mode callback that guards on `this.pin` refuses a wrong pin", async () => {
+    // The Function constructor makes a sloppy mode function in this strict mode module.
+    const checkServerIdentity = new Function(
+      "hostname",
+      "cert",
+      `if (this.pin && cert.subject.CN !== this.pin) return new Error("pin mismatch");`,
+    ) as typeof tls.checkServerIdentity;
+    await withServer(async port => {
+      const connect = (pin: string) =>
+        tls.connect({ host: "127.0.0.1", port, ca, pin, checkServerIdentity } as tls.ConnectionOptions);
+      assert.strictEqual(await outcomeOf(connect("agent1")), "secureConnect, authorized=true");
+      assert.strictEqual(await outcomeOf(connect("agent2")), "error: pin mismatch");
+    });
+  });
+
+  test("the receiver is a copy that tls.connect() makes when it is called", async () => {
+    await withServer(async port => {
+      const { options, seen } = pinned({ ca, host: "127.0.0.1", port });
+      const keys = Object.keys(options);
+      const socket = tls.connect(options);
+      options.pin = "changed after tls.connect() returned";
+      await secureConnect(socket);
+      assert.deepStrictEqual(seen(), connectOptions({ host: "127.0.0.1" }));
+      assert.deepStrictEqual(Object.keys(options), keys);
+    });
+  });
+});
+
+// Node runs the identity check only for a socket that tls.connect() made, and
+// not for a resumed session. Bun runs it in these cases too. After
+// TLSSocket#connect() the callback can come from the constructor options, of
+// which Bun keeps the function only.
+describe("checkServerIdentity where only Bun calls it: `this` is the options object that owns it", () => {
+  test("new tls.TLSSocket(options).connect(): `this` is undefined", async () => {
+    await withServer(async port => {
+      const { options, seen, receiver } = pinned({ ca });
+      // @ts-expect-error @types/node requires a socket
+      const socket = new tls.TLSSocket(undefined, options);
+      socket.connect({ host: "127.0.0.1", port });
+      await secureConnect(socket);
+      assert.deepStrictEqual({ calls: seen().calls, receiver: receiver() }, { calls: 1, receiver: undefined });
+    });
+  });
+
+  test("new tls.TLSSocket().connect(options): `this` is the options of connect()", async () => {
+    await withServer(async port => {
+      const { options, seen } = pinned({ host: "127.0.0.1", port });
+      // @ts-expect-error @types/node requires a socket
+      const socket = new tls.TLSSocket(undefined, { ca });
+      socket.connect(options);
+      await secureConnect(socket);
+      assert.deepStrictEqual(seen(), {
+        calls: 1,
+        pin: "agent1",
+        host: "127.0.0.1",
+        path: undefined,
+        ownsCallback: true,
+        isCallerObject: true,
+      });
+    });
+  });
+
+  test("a second connect() with options that do not have it: `this` is undefined", async () => {
+    await withServer(async port => {
+      const { options, seen, receiver } = pinned({ ca, host: "127.0.0.1", port });
+      const socket = tls.connect(options);
+      socket.on("data", () => {});
+      await once(socket, "close");
+      assert.strictEqual(receiver().pin, "agent1");
+
+      socket.connect({ host: "127.0.0.1", port });
+      await secureConnect(socket);
+      assert.deepStrictEqual({ calls: seen().calls, receiver: receiver() }, { calls: 2, receiver: undefined });
+    });
+  });
+
+  test("a resumed session: `this` is the connect options", async () => {
+    const server = tls.createServer({ key: serverKey, cert: serverCert, maxVersion: "TLSv1.2" }, c => c.end());
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const { port } = server.address() as AddressInfo;
+      const first = tls.connect({ host: "127.0.0.1", port, ca, servername: "agent1" });
+      const [session] = await once(first, "session");
+      first.destroy();
+
+      const { options, seen } = pinned({ host: "127.0.0.1", port, ca, servername: "agent1", session });
+      const resumed = tls.connect(options);
+      try {
+        await once(resumed, "secureConnect");
+        assert.deepStrictEqual(
+          { ...seen(), isSessionReused: resumed.isSessionReused() },
+          {
+            calls: 1,
+            pin: "agent1",
+            host: "127.0.0.1",
+            path: undefined,
+            ownsCallback: true,
+            isCallerObject: false,
+            isSessionReused: true,
+          },
+        );
+      } finally {
+        resumed.destroy();
+      }
+    } finally {
+      server.close();
+    }
   });
 });
 

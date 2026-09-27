@@ -537,7 +537,13 @@ function onClientHandshake(self, socket, success, verifyError) {
       const hostname = self.servername || options?.host || options?.socket?._host || self._host || "localhost";
       const cert = self.getPeerCertificate(true);
       if (cert) {
-        verifyError = checkServerIdentity(hostname, cert);
+        // Node calls it as a method of the connect options: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L1671
+        // Node only handshakes sockets made by tls.connect(), whose options own the callback. Options that do not own it are not its `this`.
+        const receiver =
+          options !== undefined && $getByIdDirect(options, "checkServerIdentity") === checkServerIdentity
+            ? options
+            : undefined;
+        verifyError = checkServerIdentity.$call(receiver, hostname, cert);
       }
     }
     let rejectUnauthorized;
