@@ -5,11 +5,11 @@ import path from "node:path";
 
 // JSC's first VM installs its SIGSEGV/SIGBUS handler without SA_ONSTACK.
 // Without that flag the kernel cannot deliver a native stack overflow, and the
-// process dies with no crash report. Bun::tryCreateVM (ZigGlobalObject.cpp)
+// process dies with no crash report. Bun::createVM (ZigGlobalObject.cpp)
 // creates the VM and puts the flag back. A VM created anywhere else can be the
 // first one of its process (`bun build --bytecode` never creates a global
 // object) and leave the flag off.
-test("every JSC::VM is created by Bun::tryCreateVM", async () => {
+test("every JSC::VM is created by Bun::createVM", async () => {
   const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
   const createsVM = /\bVM::(?:tryCreate|create|createContextGroup)\s*\(/;
   const sites: string[] = [];

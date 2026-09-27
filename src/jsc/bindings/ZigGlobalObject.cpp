@@ -471,15 +471,18 @@ void Zig::GlobalObject::resetOnEachMicrotaskTick()
 
 extern "C" size_t Bun__reported_memory_size;
 
-RefPtr<JSC::VM> Bun::tryCreateVM(JSC::HeapType heapType)
+Ref<JSC::VM> Bun::createVM(JSC::HeapType heapType)
 {
     RefPtr<JSC::VM> vm = JSC::VM::tryCreate(heapType);
+    if (!vm) [[unlikely]] {
+        BUN_PANIC("Failed to allocate JavaScriptCore Virtual Machine. Did your computer run out of memory? Or maybe you compiled Bun with a mismatching libc++ version or compiler?");
+    }
 #if !OS(WINDOWS)
-    // The first construction ran WTF::SignalHandlers::finalize().
+    // With its first VM, JSC installed its SIGSEGV/SIGBUS handler without SA_ONSTACK.
     static std::once_flag keepSignalHandlersOnAltStack;
     std::call_once(keepSignalHandlersOnAltStack, CrashHandler__keepSignalHandlersOnAltStack);
 #endif
-    return vm;
+    return vm.releaseNonNull();
 }
 
 // executionContextId: -1 for main thread
@@ -497,12 +500,9 @@ Zig::GlobalObject* defaultGlobalObject(JSC::VM& vm)
 extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, int32_t executionContextId, bool miniMode, bool evalMode, void* worker_ptr)
 {
     auto heapSize = miniMode ? JSC::HeapType::Small : JSC::HeapType::Large;
-    RefPtr<JSC::VM> vmPtr = Bun::tryCreateVM(heapSize);
-    if (!vmPtr) [[unlikely]] {
-        BUN_PANIC("Failed to allocate JavaScriptCore Virtual Machine. Did your computer run out of memory? Or maybe you compiled Bun with a mismatching libc++ version or compiler?");
-    }
+    Ref<JSC::VM> vmPtr = Bun::createVM(heapSize);
     vmPtr->refSuppressingSaferCPPChecking();
-    JSC::VM& vm = *vmPtr;
+    JSC::VM& vm = vmPtr.get();
     // This must happen before JSVMClientData::create
     vm.heap.acquireAccess();
     JSC::JSLockHolder locker(vm);

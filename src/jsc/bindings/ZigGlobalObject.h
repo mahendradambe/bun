@@ -861,9 +861,8 @@ public:
 
 namespace Bun {
 
-// Every JSC::VM in bun comes from here: JSC's first VM installs its SIGSEGV/SIGBUS
-// handler without SA_ONSTACK, and this puts the flag back for the crash handler.
-RefPtr<JSC::VM> tryCreateVM(JSC::HeapType);
+// Every JSC::VM comes from here, which keeps SA_ONSTACK on the crash signal handlers.
+Ref<JSC::VM> createVM(JSC::HeapType);
 
 void putDirectNamed(JSC::VM&, JSC::JSObject*, ASCIILiteral name, JSC::JSValue);
 
