@@ -6,7 +6,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 use std::collections::VecDeque;
 
-use crate::mysql::js_mysql_query::JSMySQLQuery;
+use crate::mysql::js_mysql_query::{JSMySQLQuery, QueryValues};
 // The queue's "connection" param is the JS-wrapper type (it calls
 // `reset_connection_timeout`/`on_error` which live on the wrapper, plus
 // `is_able_to_write` which forwards to the inner protocol struct).
@@ -33,7 +33,7 @@ pub struct MySQLRequestQueue {
 }
 
 /// What a request is to the counters of the queue once it ran.
-enum Started {
+pub(crate) enum Started {
     /// Nothing was written: the request waits.
     No,
     /// The prepare of its statement was written.
@@ -132,6 +132,9 @@ impl MySQLRequestQueue {
         // momentary `Deref` lifetime. All queue mutation below goes through
         // `Cell`/`JsCell` interior mutability — `&Self` is sufficient.
         let queue_ref: ParentRef<Self> = ParentRef::new(&conn_ref.connection.get().queue);
+        // A request left the queue with nothing sent: no reply comes that would update the
+        // timer and the event loop ref.
+        let mut failed_to_start = false;
         // reshaped for borrowck — the cleanup that must run at function exit
         // became a post-block pass; early returns become
         // `break 'advance` so cleanup always runs at function exit.
@@ -156,6 +159,12 @@ impl MySQLRequestQueue {
                     continue;
                 }
 
+                if req.is_binding() {
+                    debug!("isBinding");
+                    // The conversion of its parameters runs below this call. It is written
+                    // when the conversion returns, and no request goes ahead of it.
+                    break 'advance;
+                }
                 if req.is_being_prepared() {
                     debug!("isBeingPrepared");
                     queue_ref.waiting_to_prepare.set(true);
@@ -175,23 +184,37 @@ impl MySQLRequestQueue {
                     continue;
                 }
 
-                // `run()` *does* read queue scalars
+                // The conversion of the parameters runs user JS, which can take the request
+                // out of the queue and can change what is ahead of it.
+                let _req_guard = req.ref_guard();
+                // `start()` *does* read queue scalars
                 // (`can_execute_query`/`can_pipeline`/`can_prepare_query`),
                 // but only through `conn_ref`'s shared reborrow into the same
                 // `Cell`-wrapped fields — overlapping shared reads are sound.
-                if let Err(err) = req.run(conn_ref.get()) {
-                    debug!("run failed");
-                    // R-2: `on_error` takes `&self`.
-                    conn_ref.on_error(Some(req.get()), err);
-                    // `on_error` completed the request: the branch above retires it.
-                    continue;
+                let started = queue_ref.start(conn_ref.get(), &req, req.values());
+                if !queue_ref.is_at(offset, &req) {
+                    offset = queue_ref.position(&req).unwrap_or(0);
                 }
-                match queue_ref.account(&req) {
-                    Started::No => {}
-                    Started::Preparing | Started::NotPipelined => {
+                match started {
+                    Err(err) => {
+                        debug!("run failed");
+                        failed_to_start = true;
+                        if conn_ref.has_pending_termination() {
+                            // No JS runs while a termination is pending: the request
+                            // completes without its reject callback.
+                            req.mark_as_failed();
+                            break 'advance;
+                        }
+                        // R-2: `on_error` takes `&self`.
+                        conn_ref.on_error(Some(req.get()), err);
+                        // `on_error` completed the request: the branch above retires it.
+                        continue;
+                    }
+                    Ok(Started::No) => {}
+                    Ok(Started::Preparing | Started::NotPipelined) => {
                         conn_ref.reset_connection_timeout();
                     }
-                    Started::Pipelined => {
+                    Ok(Started::Pipelined) => {
                         conn_ref.reset_connection_timeout();
                         // `can_pipeline` takes `&self` + `&MySQLConnection`;
                         // both are shared reborrows — overlapping reads are sound.
@@ -217,6 +240,37 @@ impl MySQLRequestQueue {
             debug!("isCompleted discard after advance");
             queue_ref.requests.with_mut(|q| q.pop_front());
         }
+        if failed_to_start {
+            conn_ref.update_idle_state();
+        }
+    }
+
+    /// Starts `request`, which has its place in the queue. This is the one path to the write
+    /// of a command: the gates of the queue decide whether the connection takes it now.
+    pub(crate) fn start(
+        &self,
+        connection: &MySQLConnection,
+        request: &JSMySQLQuery,
+        values: QueryValues<'_>,
+    ) -> Result<Started, AnyMySQLError> {
+        request.run(connection, values)?;
+        Ok(self.account(request))
+    }
+
+    fn is_at(&self, offset: usize, request: &JSMySQLQuery) -> bool {
+        (self.requests.get().get(offset)).is_some_and(|at| core::ptr::eq(at.as_ptr(), request))
+    }
+
+    fn position(&self, request: &JSMySQLQuery) -> Option<usize> {
+        (self.requests.get().iter()).position(|at| core::ptr::eq(at.as_ptr(), request))
+    }
+
+    /// Takes `request` out of the queue. It is the last one that has this request, if any.
+    pub(crate) fn remove(&self, request: &JSMySQLQuery) {
+        let at = (self.requests.get().iter()).rposition(|at| core::ptr::eq(at.as_ptr(), request));
+        // The drop of the queue's ref can free the request: it runs outside `with_mut`.
+        let removed = at.and_then(|at| self.requests.with_mut(|q| q.remove(at)));
+        drop(removed);
     }
 
     pub(crate) fn init() -> Self {
@@ -253,10 +307,15 @@ impl MySQLRequestQueue {
         Started::NotPipelined
     }
 
-    pub(crate) fn add(&mut self, req: RefPtr<JSMySQLQuery>) {
+    /// Gives `req` the last place in the queue. Returns whether it is the next request to
+    /// start: no request ahead of it waits to be written.
+    pub(crate) fn add(&self, req: RefPtr<JSMySQLQuery>) -> bool {
         debug!("add");
-        self.account(&req);
+        let is_next = (self.requests.get().iter().rev())
+            .find(|ahead| !ahead.is_completed())
+            .is_none_or(|ahead| !ahead.is_pending() && !ahead.is_binding());
         self.requests.with_mut(|q| q.push_back(req));
+        is_next
     }
 
     /// The queue's `RefPtr` keeps the pointee live; `JSMySQLQuery` is a

@@ -20,7 +20,7 @@ use bun_sql::mysql::protocol::new_writer::NewWriter;
 use bun_sql::mysql::ssl_mode::SSLMode;
 use bun_uws::{self as uws, AnySocket, NewSocketHandler, SocketTCP};
 
-use super::js_mysql_query::JSMySQLQuery;
+use super::js_mysql_query::{JSMySQLQuery, QueryValues};
 use crate::mysql::protocol::any_mysql_error_jsc::mysql_error_to_js;
 use crate::mysql::protocol::error_packet_jsc::ErrorPacketJsc;
 // `my_sql_connection::MySQLConnection` (the protocol-layer struct)
@@ -196,7 +196,7 @@ impl JSMySQLConnection {
         keep_flusher_registered
     }
 
-    fn register_auto_flusher(&self) {
+    pub(crate) fn register_auto_flusher(&self) {
         if !self.auto_flusher.get().registered // should not be registered
             && self.connection.get().can_flush()
         {
@@ -362,11 +362,43 @@ impl JSMySQLConnection {
         )))
     }
 
-    pub(crate) fn enqueue_request(&self, item: RefPtr<JSMySQLQuery>) {
+    /// Gives `item` the last place in the queue. Returns whether it is the next request to
+    /// start: no request ahead of it waits to be written.
+    pub(crate) fn enqueue_request(&self, item: RefPtr<JSMySQLQuery>) -> bool {
         bun_core::scoped_log!(MySQLConnection, "enqueueRequest");
-        self.connection_mut().enqueue_request(item);
-        self.reset_connection_timeout();
+        self.connection.get().queue.add(item)
+    }
+
+    /// Starts the request that `enqueue_request` returned true for.
+    pub(crate) fn start_request(
+        &self,
+        request: &JSMySQLQuery,
+        values: QueryValues<'_>,
+    ) -> Result<(), AnyMySQLErrorT> {
+        let started = self.connection.get().queue.start(self, request, values);
+        started.map(|_| ())
+    }
+
+    /// Takes out the request that failed to start in the call that queued it.
+    pub(crate) fn remove_request(&self, request: &JSMySQLQuery) {
+        self.connection.get().queue.remove(request);
+    }
+
+    /// Makes the timer, the event loop ref and the flusher follow the queue. A reply ends
+    /// with this. So does a request that left the queue with nothing sent: no reply comes
+    /// for it.
+    #[inline]
+    pub(crate) fn update_idle_state(&self) {
+        if self.connection.get().status == my_sql_connection::Status::Connected {
+            self.reset_connection_timeout();
+        }
+        self.update_reference_type();
         self.register_auto_flusher();
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_termination(&self) -> bool {
+        self.global_object.has_pending_termination_exception()
     }
 
     fn drain_internal(&self) {
@@ -980,11 +1012,7 @@ impl<const SSL: bool> SocketHandler<SSL> {
             // `_guard` has not yet dropped, so `*p` is still live; `ParentRef`
             // yields a fresh `&JSMySQLConnection` per access (R-2: every
             // callee is `&self`).
-            if p.connection.get().status == my_sql_connection::Status::Connected {
-                p.reset_connection_timeout();
-            }
-            p.update_reference_type();
-            p.register_auto_flusher();
+            p.update_idle_state();
         }
         let _loop_guard = this.event_loop().entered();
         this.ensure_js_value_is_alive();
