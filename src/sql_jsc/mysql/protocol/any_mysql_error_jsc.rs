@@ -75,14 +75,27 @@ impl<T: MaybeBytes> MaybeBytes for Option<T> {
     }
 }
 
+#[inline]
 pub(crate) fn mysql_error_to_js(
     global_object: &JSGlobalObject,
     // Falls back to the error name when no message is given.
     message: impl MaybeBytes,
     err: impl IntoAnyMySQLError,
 ) -> JSValue {
-    let name = err.mysql_error_name();
-    let msg: &[u8] = message.as_maybe_bytes().unwrap_or(name.as_bytes());
+    mysql_error_name_to_js(
+        global_object,
+        message.as_maybe_bytes(),
+        err.mysql_error_name(),
+    )
+}
+
+/// The body of [`mysql_error_to_js`], which is generic: one copy for all of its callers.
+fn mysql_error_name_to_js(
+    global_object: &JSGlobalObject,
+    message: Option<&[u8]>,
+    name: &'static str,
+) -> JSValue {
+    let msg: &[u8] = message.unwrap_or(name.as_bytes());
 
     let code: &'static [u8] = match name {
         "ConnectionClosed" => b"ERR_MYSQL_CONNECTION_CLOSED",

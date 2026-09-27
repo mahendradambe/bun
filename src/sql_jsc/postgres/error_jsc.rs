@@ -1,6 +1,9 @@
 //! `createPostgresError` / `postgresErrorToJS` bridges.
 
-use crate::jsc::{JSGlobalObject, JSValue, JsError, JsResult, bun_string_jsc};
+use crate::jsc::{
+    JSGlobalObject, JSValue, JsError, JsResult, VirtualMachineSqlExt as _, bun_string_jsc,
+    create_sql_error,
+};
 use bun_sql::postgres::any_postgres_error::{AnyPostgresError, PostgresErrorOptions};
 
 pub(crate) fn create_postgres_error(
@@ -8,16 +11,21 @@ pub(crate) fn create_postgres_error(
     message: &[u8],
     options: &PostgresErrorOptions,
 ) -> JsResult<JSValue> {
-    let opts_obj = JSValue::create_empty_object(global, 0);
-    opts_obj.ensure_still_alive();
-    opts_obj.put(
+    let structure = global
+        .bun_vm()
+        .as_mut()
+        .sql_state()
+        .postgresql_context
+        .error_structure
+        .get();
+    let error = create_sql_error(global, structure, false, message)?;
+    error.put(
         global,
         b"code",
         bun_string_jsc::create_utf8_for_js(global, options.code)?,
     );
-    // Each optional field is `put` by name when `Some`. Property names must
-    // stay camelCase (`internalPosition`, `internalQuery`, `dataType`) since
-    // the JS consumer reads `options.internalPosition` etc.
+    // The names and the order are those of the `PostgresError` constructor in
+    // `src/js/internal/sql/errors.ts`.
     let optional_fields: [(&'static [u8], Option<&[u8]>); 16] = [
         (b"errno", options.errno),
         (b"detail", options.detail),
@@ -37,15 +45,17 @@ pub(crate) fn create_postgres_error(
         (b"routine", options.routine),
     ];
     for (name, value) in optional_fields {
-        opts_obj.put_optional_utf8(global, name, value)?;
+        let Some(value) = value else { continue };
+        let value = bun_string_jsc::create_utf8_for_js(global, value)?;
+        // An Error has its own `line` and `column`, and they are not enumerable.
+        if matches!(name, b"line" | b"column") {
+            error.put_non_enumerable(global, name, value);
+        } else {
+            error.put(global, name, value);
+        }
     }
-    opts_obj.put(
-        global,
-        b"message",
-        bun_string_jsc::create_utf8_for_js(global, message)?,
-    );
 
-    Ok(opts_obj)
+    Ok(error)
 }
 
 pub(crate) fn postgres_error_to_js(

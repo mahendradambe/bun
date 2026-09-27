@@ -311,6 +311,9 @@ initPostgres(
       query.reject(reject as Error);
     } catch {}
   },
+
+  // Native makes its errors with this prototype.
+  PostgresError.prototype,
 );
 
 export interface PostgresDotZig {
@@ -324,6 +327,7 @@ export interface PostgresDotZig {
       is_last: boolean,
     ) => void,
     onRejectQuery: (query: Query<any, any>, err: Error, queries) => void,
+    errorPrototype: object,
   ) => void;
   createConnection: (
     hostname: string | undefined,

@@ -85,6 +85,9 @@ initMySQL(
       query.reject(reject as Error);
     } catch {}
   },
+
+  // Native makes its errors with this prototype.
+  MySQLError.prototype,
 );
 
 export interface MySQLDotZig {
@@ -100,6 +103,7 @@ export interface MySQLDotZig {
       affected_rows: number,
     ) => void,
     onRejectQuery: (query: Query<any, any>, err: Error, queries) => void,
+    errorPrototype: object,
   ) => void;
   createConnection: (
     hostname: string | undefined,
