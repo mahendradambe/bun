@@ -265,6 +265,7 @@ const upgradeDuplexToTLS = $newRustFunction("runtime/socket/socket.rs", "jsUpgra
 const upgradeTLSDeferred = $newRustFunction("runtime/socket/socket.rs", "jsUpgradeTLSDeferred", 2);
 const isNamedPipeSocket = $newRustFunction("runtime/socket/socket.rs", "jsIsNamedPipeSocket", 1);
 const getBufferedAmount = $newRustFunction("runtime/socket/socket.rs", "jsGetBufferedAmount", 1);
+const kLastWriteQueueSize = Symbol("kLastWriteQueueSize");
 
 const bunTlsSymbol = Symbol.for("::buntls::");
 const bunSocketServerOptions = Symbol.for("::bunnetserveroptions::");
@@ -2004,18 +2005,26 @@ Socket.prototype.address = function address() {
 };
 
 Socket.prototype._onTimeout = function () {
-  // if there is pending data, write is in progress
-  // so we suppress the timeout
-  if (this._pendingData) {
+  const handle = this._handle;
+  const buffered = handle ? getBufferedAmount(handle) : 0;
+  const lastBuffered = this[kLastWriteQueueSize];
+  this[kLastWriteQueueSize] = buffered;
+
+  // A write counts as in progress only if the queue MOVED since the previous
+  // expiry. Suppressing on a merely non-empty queue never rescheduled the timer,
+  // so a socket whose TCP handshake never completes held its queued write
+  // forever and was never bounded at all: the timer fired once, returned here,
+  // and nothing re-armed it. That left one retained socket per request for as
+  // long as the peer stayed unreachable.
+  //
+  // lastBuffered === undefined is the first expiry, where nothing has been seen
+  // draining yet, so an idle or still-connecting socket times out on schedule
+  // rather than at twice its configured bound.
+  if (buffered > 0 && lastBuffered !== undefined && buffered !== lastBuffered) {
+    this._unrefTimer();
     return;
   }
 
-  const handle = this._handle;
-  // if there is a handle, and it has pending data,
-  // we suppress the timeout because a write is in progress
-  if (handle && getBufferedAmount(handle) > 0) {
-    return;
-  }
   this.emit("timeout");
 };
 
