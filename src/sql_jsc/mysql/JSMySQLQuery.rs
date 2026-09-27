@@ -214,7 +214,7 @@ impl JSMySQLQuery {
                 );
             }
         };
-        this.query.with_mut(|q| q.set_result_mode(mode));
+        this.query.get().set_result_mode(mode);
         Ok(JSValue::UNDEFINED)
     }
 
@@ -241,7 +241,7 @@ impl JSMySQLQuery {
             }
         });
 
-        if !self.query.with_mut(|q| q.result(is_last_result)) {
+        if !self.query.get().result(is_last_result) {
             return;
         }
 
@@ -305,7 +305,7 @@ impl JSMySQLQuery {
         if self.this_value.get().is_not_empty() {
             self.this_value.with_mut(|v| v.downgrade());
         }
-        let _ = self.query.with_mut(|q| q.fail());
+        let _ = self.query.get().fail();
     }
 
     pub(crate) fn reject(&self, queries_array: JSValue, err: AnyMySQLError::Error) {
@@ -330,7 +330,7 @@ impl JSMySQLQuery {
             }
         });
 
-        if !self.query.with_mut(|q| q.fail()) {
+        if !self.query.get().fail() {
             return;
         }
 
@@ -397,18 +397,10 @@ impl JSMySQLQuery {
 
         let columns_value = self.get_columns().unwrap_or(JSValue::UNDEFINED);
         let binding_value = self.get_binding().unwrap_or(JSValue::UNDEFINED);
-        // R-2: `JsCell::with_mut` scopes the `&mut MySQLQuery` to the closure
-        // body. `run_query` may run user JS (binding getters), which could
-        // re-enter another host-fn on this `JSMySQLQuery`; that re-entrant call
-        // would form a fresh `&Self` — sound, since the noalias attribute is
-        // suppressed by the `UnsafeCell` in `JsCell`. A re-entrant `with_mut`
-        // on `self.query` would still alias; `set_mode_from_js` is the only
-        // such path and is not reachable from a binding getter in well-formed
-        // SQL usage. This mirrors the pre-R-2 behaviour but with the *outer*
-        // `&mut self` UB structurally eliminated.
-        if let Err(err) = self
-            .query
-            .with_mut(|q| q.run_query(connection, global_object, columns_value, binding_value))
+        // `run_query` may run user JS (binding getters), which can re-enter a host
+        // fn on this `JSMySQLQuery`: no `&mut MySQLQuery` is alive across it.
+        if let Err(err) =
+            (self.query.get()).run_query(connection, global_object, columns_value, binding_value)
         {
             debug!("run failed to execute query");
             if !global_object.has_exception() {
@@ -464,7 +456,7 @@ impl JSMySQLQuery {
     }
 
     pub(crate) fn mark_as_prepared(&self) {
-        self.query.with_mut(|q| q.mark_as_prepared());
+        self.query.get().mark_as_prepared();
     }
 
     #[inline]
