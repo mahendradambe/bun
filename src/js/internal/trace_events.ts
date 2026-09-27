@@ -380,14 +380,16 @@ function emitMetadata(target: object[] = events) {
 
 // Called from the node:worker_threads Worker constructor: when tracing is
 // active, record the Node-style worker thread-name metadata event
-// (`[worker N] <name || 'WorkerThread'>`). No-op while tracing is off, so
+// (`[worker N] <name>`, or `[worker N]` for an empty name:
+// https://github.com/nodejs/node/blob/v26.3.0/src/node_worker.cc#L297-L298).
+// `name` is the Worker's normalized name. No-op while tracing is off, so
 // untraced worker spawns stay free. `threadId` is the spawned worker's
 // actual global thread id (Node prints its `thread_id_` the same way), so
 // the row lands on the same tid the worker's own events use
 // (initFromCli sets the worker VM's tid to threadId + 1) — a per-VM
 // counter would drift for nested workers or workers spawned before
 // tracing activated.
-function emitWorkerThreadName(name: unknown, threadId: number) {
+function emitWorkerThreadName(name: string, threadId: number) {
   if (!activated) return;
   events.push({
     pid: process.pid,
@@ -396,7 +398,7 @@ function emitWorkerThreadName(name: unknown, threadId: number) {
     ph: "M",
     cat: "__metadata",
     name: "thread_name",
-    args: { name: `[worker ${threadId}] ${typeof name === "string" && name.length !== 0 ? name : "WorkerThread"}` },
+    args: { name: name === "" ? `[worker ${threadId}]` : `[worker ${threadId}] ${name}` },
   });
 }
 

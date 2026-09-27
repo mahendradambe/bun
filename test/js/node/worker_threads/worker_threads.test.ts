@@ -1,5 +1,5 @@
 import { describe, expect, it, setDefaultTimeout, test } from "bun:test";
-import { bunEnv, bunExe, isDebug, tempDir, tmpdirSync } from "harness";
+import { bunEnv, bunExe, isDebug, isLinux, tempDir, tmpdirSync } from "harness";
 import { once } from "node:events";
 import fs from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -910,6 +910,163 @@ test("worker name survives parent-side GC and terminate cycles", async () => {
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   expect(stdout.trim()).toBe("done");
   expect(exitCode).toBe(0);
+});
+
+describe("worker name", () => {
+  // Runs `source` in a node Worker until the worker exits.
+  async function runNodeWorker(source: string, options: object = {}) {
+    const worker = new Worker(source, { eval: true, ...options });
+    const { threadId, threadName } = worker;
+    const messages: unknown[] = [];
+    const { promise: exited, resolve, reject } = Promise.withResolvers<number>();
+    worker.on("message", message => messages.push(message));
+    worker.on("error", reject);
+    worker.on("exit", resolve);
+    const exitCode = await exited;
+    return { threadId, threadName, threadNameAfterExit: worker.threadName, messages, exitCode };
+  }
+
+  // Runs `source` in a web Worker until the worker posts a message.
+  async function runWebWorker(source: string) {
+    const url = URL.createObjectURL(new Blob([source]));
+    let worker: InstanceType<typeof globalThis.Worker> | undefined;
+    try {
+      const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+      worker = new globalThis.Worker(url);
+      worker.onmessage = event => resolve(event.data);
+      worker.onerror = event => reject(new Error(event.message));
+      worker.addEventListener("close", () => reject(new Error("the web Worker closed before it posted a message")));
+      return await promise;
+    } finally {
+      worker?.terminate();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  // A falsy options.name gives the default. A whitespace-only name is truthy:
+  // it trims to "" and gets no default.
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/worker.js#L280-L284
+  test("defaults to 'WorkerThread' when options.name is absent or falsy", async () => {
+    const source = `
+      const { parentPort, threadName } = require("node:worker_threads");
+      parentPort.postMessage(threadName);
+    `;
+    async function names(options: object) {
+      const { threadName, threadNameAfterExit, messages, exitCode } = await runNodeWorker(source, options);
+      return { fromParent: threadName, fromWorker: messages, afterExit: threadNameAfterExit, exitCode };
+    }
+    const [absent, empty, nullName, zero, whitespace, padded, webWorker] = await Promise.all([
+      names({}),
+      names({ name: "" }),
+      names({ name: null }),
+      names({ name: 0 }),
+      names({ name: " \t " }),
+      names({ name: "  padded  " }),
+      runWebWorker(source),
+    ]);
+
+    const byDefault = { fromParent: "WorkerThread", fromWorker: ["WorkerThread"], afterExit: null, exitCode: 0 };
+    expect({ mainThread: wt.threadName, absent, empty, nullName, zero, whitespace, padded, webWorker }).toEqual({
+      mainThread: "",
+      absent: byDefault,
+      empty: byDefault,
+      nullName: byDefault,
+      zero: byDefault,
+      whitespace: { fromParent: "", fromWorker: [""], afterExit: null, exitCode: 0 },
+      padded: { fromParent: "padded", fromWorker: ["padded"], afterExit: null, exitCode: 0 },
+      // A web Worker is not a node Worker: its name has no default.
+      webWorker: "",
+    });
+  });
+
+  // https://github.com/nodejs/node/blob/v26.3.0/src/node_worker.cc#L758
+  // Linux only: the worker reads the name from procfs. macOS has no procfs, and
+  // Bun does not name threads on Windows.
+  test.skipIf(!isLinux)("names the OS thread of the worker", async () => {
+    const source = `
+      const osThreadName = require("node:fs").readFileSync("/proc/thread-self/comm", "utf8").trim();
+      require("node:worker_threads").parentPort.postMessage(osThreadName);
+    `;
+    const [unnamed, named, blank, webWorker] = await Promise.all([
+      runNodeWorker(source),
+      runNodeWorker(source, { name: "named" }),
+      runNodeWorker(source, { name: "   " }),
+      runWebWorker(source),
+    ]);
+
+    expect({ unnamed: unnamed.messages, named: named.messages, blank: blank.messages, webWorker }).toEqual({
+      unnamed: ["WorkerThread"],
+      named: ["named"],
+      // node gives this thread an empty name. Bun treats an empty Worker name as no name.
+      blank: ["Worker"],
+      webWorker: "Worker",
+    });
+  });
+
+  // https://github.com/nodejs/node/blob/v26.3.0/src/node_worker.cc#L297-L298
+  test("titles the worker in trace events, with no name part when the name is empty", async () => {
+    using dir = tempDir("worker-name-trace-events", {
+      "main.cjs": `
+        const { Worker } = require("node:worker_threads");
+        new Worker("1", { eval: true });
+        new Worker("1", { eval: true, name: "   " });
+        new Worker("1", { eval: true, name: "named" });
+      `,
+    });
+    const traceFile = join(String(dir), "node_trace.log");
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "--trace-event-categories", "node", "--trace-event-file-pattern", traceFile, "main.cjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // The trace file is written at exit. Show the fixture's stderr when it fails,
+    // but do not require an empty one: ASAN/debug lanes emit benign warnings there.
+    const events = exitCode === 0 ? JSON.parse(fs.readFileSync(traceFile, "utf8")).traceEvents : [];
+    const titles = events
+      .filter(
+        event => event.cat === "__metadata" && event.name === "thread_name" && event.args.name.startsWith("[worker "),
+      )
+      .map(event => event.args.name)
+      .sort();
+
+    expect({ titles, stdout, stderr: exitCode === 0 ? "" : stderr, exitCode }).toEqual({
+      titles: ["[worker 1] WorkerThread", "[worker 2]", "[worker 3] named"],
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // https://github.com/nodejs/node/blob/v26.3.0/src/inspector/worker_inspector.cc#L28-L31
+  test("titles the worker in the inspector, with no name part when the name is empty", async () => {
+    const source = `
+      const { Session } = require("node:inspector");
+      const { parentPort } = require("node:worker_threads");
+      // Keeps the worker alive until the inspector reports it.
+      parentPort.once("message", () => {});
+      const session = new Session();
+      session.connectToMainThread();
+      session.on("NodeWorker.attachedToWorker", ({ params }) => {
+        parentPort.postMessage(params.workerInfo.title);
+        process.exit();
+      });
+      session.post("NodeWorker.enable", { waitForDebuggerOnStart: false });
+    `;
+    // One worker at a time: in node, the session reports every live worker of the main thread.
+    const unnamed = await runNodeWorker(source);
+    const blank = await runNodeWorker(source, { name: "   " });
+    const named = await runNodeWorker(source, { name: "named" });
+
+    expect({ unnamed: unnamed.messages, blank: blank.messages, named: named.messages }).toEqual({
+      unnamed: [`[worker ${unnamed.threadId}] WorkerThread`],
+      blank: [`[worker ${blank.threadId}]`],
+      named: [`[worker ${named.threadId}] named`],
+    });
+  });
 });
 
 test("partially transferred FileHandles are restored when a later transfer throws", async () => {
